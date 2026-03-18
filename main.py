@@ -1,606 +1,399 @@
-import telebot
-import requests
-import random
-import json
-import re
+import sys
+import asyncio
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import os
-import time
-import threading
-from datetime import datetime
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
-from config import BOT_TOKEN, ADMIN_ID, CHANNEL_URL
+import re
+import zipfile
+import tempfile
+import aiohttp
+import aiofiles
+import logging
+import shutil
+from urllib.parse import urljoin, urlparse, unquote
+from bs4 import BeautifulSoup
+from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 
-bot = telebot.TeleBot(BOT_TOKEN)
-bot.parse_mode = "HTML"
+try:
+    from config import API_ID, API_HASH, BOT_TOKEN, COMMAND_PREFIX
+except ImportError:
+    print("ERROR: config.py not found or missing required variables!")
+    sys.exit(1)
 
-USERS_FILE = 'users.json'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+bot_session_name = f"session_{BOT_TOKEN.split(':')[0]}"
 
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
+bot = Client(
+    bot_session_name,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=1000,
+    parse_mode=ParseMode.MARKDOWN
+)
 
-def add_user(user_id, username, first_name):
-    users = load_users()
-    if str(user_id) not in users:
-        users[str(user_id)] = {
-            'user_id': user_id,
-            'username': username,
-            'first_name': first_name,
-            'joined_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'last_active': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+START_MSG = """Welcome to {bot_name}!
+
+I can fetch and package the full source code of any website, including:
+HTML | CSS | JS | Images | Fonts | Media
+
+How to use:
+- Send /ws <url> or /websource <url>
+- I will grab all assets and send you a neat .zip file
+
+Works in Private, Groups & Supergroups.  
+Max archive size: 50 MB
+Ready? Just send me a website link!
+"""
+
+class UrlDownloader:
+    def __init__(self, imgFlg=True, linkFlg=True, scriptFlg=True):
+        self.soup = None
+        self.imgFlg = imgFlg
+        self.linkFlg = linkFlg
+        self.scriptFlg = scriptFlg
+        self.extensions = {
+            'css': 'css', 'js': 'js', 'mjs': 'js', 'png': 'images',
+            'jpg': 'images', 'jpeg': 'images', 'gif': 'images', 'svg': 'images',
+            'ico': 'images', 'webp': 'images', 'avif': 'images', 'woff': 'fonts',
+            'woff2': 'fonts', 'ttf': 'fonts', 'eot': 'fonts', 'otf': 'fonts',
+            'json': 'json', 'xml': 'xml', 'txt': 'txt', 'pdf': 'documents',
+            'mov': 'media', 'mp4': 'media', 'webm': 'media', 'ogg': 'media', 'mp3': 'media'
         }
-        save_users(users)
-    else:
-        users[str(user_id)]['last_active'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        users[str(user_id)]['username'] = username
-        users[str(user_id)]['first_name'] = first_name
-        save_users(users)
+        self.size_limit = 50 * 1024 * 1024
+        self.semaphore = asyncio.Semaphore(25)
+        self.downloaded_files = set()
+        self.failed_urls = set()
 
-class NovGenBot:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.bot_name = "NovGen"
-
-    def generate_valid_card(self, bin_number):
-        remaining_length = 16 - len(bin_number)
-        card_number = bin_number
-        
-        for i in range(remaining_length - 1):
-            card_number += str(random.randint(0, 9))
-        
-        total = 0
-        reverse_digits = [int(d) for d in str(card_number)][::-1]
-        
-        for i, digit in enumerate(reverse_digits):
-            if i % 2 == 0:
-                total += digit
-            else:
-                doubled = digit * 2
-                total += doubled if doubled < 10 else doubled - 9
-        
-        checksum = (total * 9) % 10
-        card_number += str(checksum)
-        
-        return card_number
-
-    def generate_luhn_cards(self, bin_number, count=10):
-        cards = []
-        
-        for _ in range(count):
-            card_number = self.generate_valid_card(bin_number)
-            
-            current_year = datetime.now().year
-            exp_month = random.randint(1, 12)
-            exp_year = random.randint(current_year, current_year + 5)
-            
-            cvv = str(random.randint(100, 999)).zfill(3)
-            
-            cards.append(f"{card_number} | {str(exp_month).zfill(2)} | {exp_year} | {cvv}")
-        
-        return cards
-
-    def get_bin_info(self, bin_number):
+    async def savePage(self, url, pagefolder='page', session=None):
+        logger.info(f"Downloading Source Code: {url}")
         try:
-            response = self.session.get(f"https://lookup.binlist.net/{bin_number}")
-            if response.status_code == 200:
-                data = response.json()
-                
-                scheme = data.get('scheme', 'UNKNOWN').upper()
-                if scheme == 'VISA':
-                    scheme = 'VISA CREDIT'
-                elif scheme == 'MASTERCARD':
-                    scheme = 'MASTER CARD'
-                elif scheme == 'AMEX':
-                    scheme = 'AMERICAN EXPRESS'
-                elif scheme == 'DISCOVER':
-                    scheme = 'DISCOVER'
-                elif scheme == 'JCB':
-                    scheme = 'JCB'
-                elif scheme == 'DINERS':
-                    scheme = 'DINERS CLUB'
-                elif scheme == 'RUPAY':
-                    scheme = 'RUPAY'
-                
-                bank = data.get('bank', {}).get('name', 'UNKNOWN BANK')
-                if bank != 'UNKNOWN BANK':
-                    bank = bank.upper()
-                
-                country = data.get('country', {}).get('name', 'UNKNOWN')
-                if country != 'UNKNOWN':
-                    country = country.upper()
-                
-                card_type = data.get('type', 'UNKNOWN').upper()
-                
-                return {
-                    'bank': bank,
-                    'country': country,
-                    'scheme': scheme,
-                    'type': card_type
-                }
-        except Exception as e:
-            pass
-        
-        bin_prefix = bin_number[:6]
-        first_digit = bin_number[0] if bin_number else '0'
-        
-        if first_digit == '4':
-            return {
-                'bank': 'VARIOUS BANKS',
-                'country': 'VARIOUS COUNTRIES',
-                'scheme': 'VISA CREDIT',
-                'type': 'CREDIT'
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             }
-        elif first_digit == '5':
-            return {
-                'bank': 'VARIOUS BANKS',
-                'country': 'VARIOUS COUNTRIES',
-                'scheme': 'MASTER CARD',
-                'type': 'CREDIT'
-            }
-        elif first_digit == '3':
-            if bin_prefix.startswith('34') or bin_prefix.startswith('37'):
-                return {
-                    'bank': 'VARIOUS BANKS',
-                    'country': 'VARIOUS COUNTRIES',
-                    'scheme': 'AMERICAN EXPRESS',
-                    'type': 'CREDIT'
-                }
-            else:
-                return {
-                    'bank': 'VARIOUS BANKS',
-                    'country': 'VARIOUS COUNTRIES',
-                    'scheme': 'DINERS CLUB',
-                    'type': 'CREDIT'
-                }
-        elif first_digit == '6':
-            return {
-                'bank': 'VARIOUS BANKS',
-                'country': 'VARIOUS COUNTRIES',
-                'scheme': 'DISCOVER',
-                'type': 'CREDIT'
-            }
-        elif first_digit == '2':
-            return {
-                'bank': 'VARIOUS BANKS',
-                'country': 'VARIOUS COUNTRIES',
-                'scheme': 'MASTER CARD',
-                'type': 'CREDIT'
-            }
-        else:
-            return {
-                'bank': 'UNKNOWN BANK',
-                'country': 'UNKNOWN',
-                'scheme': 'UNKNOWN',
-                'type': 'UNKNOWN'
-            }
-
-    def check_card(self, card_number, expiry_month, expiry_year, cvv):
-        try:
-            if len(card_number) != 16 or not card_number.isdigit():
-                return {'status': 'DECLINED', 'message': 'Invalid card number format'}
             
-            current_date = datetime.now()
-            current_year = current_date.year
-            current_month = current_date.month
-            
-            exp_year = int(expiry_year)
-            exp_month = int(expiry_month)
-            
-            if exp_year < current_year or (exp_year == current_year and exp_month < current_month):
-                return {'status': 'DECLINED', 'message': 'Card expired'}
-            
-            if not self.luhn_check(card_number):
-                return {
-                    'status': 'DECLINED', 
-                    'message': 'Invalid card',
-                    'bin_info': self.get_bin_info(card_number[:6])
-                }
-            
-            bin_info = self.get_bin_info(card_number[:6])
-            
-            if random.random() < 0.8:
-                return {
-                    'status': 'APPROVED',
-                    'message': 'Live CC',
-                    'bin_info': bin_info
-                }
-            else:
-                return {
-                    'status': 'DECLINED',
-                    'message': 'Dead CC',
-                    'bin_info': bin_info
-                }
-                
-        except Exception as e:
-            return {'status': 'ERROR', 'message': f'Check failed: {str(e)}'}
+            async with session.get(url, timeout=20, headers=headers, allow_redirects=True) as response:
+                if response.status != 200:
+                    return False, f"HTTP error {response.status}: {response.reason}", []
 
-    def luhn_check(self, card_number):
-        total = 0
-        reverse_digits = [int(d) for d in str(card_number)][::-1]
-        
-        for i, digit in enumerate(reverse_digits):
-            if i % 2 == 1:
-                doubled = digit * 2
-                total += doubled if doubled < 10 else doubled - 9
-            else:
-                total += digit
-        
-        return total % 10 == 0
+                content = await response.read()
+                if len(content) > self.size_limit:
+                    return False, "Size limit of 50 MB exceeded.", []
 
-    def validate_bin(self, bin_number):
-        bin_number = bin_number.replace(' ', '')
-        if bin_number.isdigit() and 6 <= len(bin_number) <= 15:
-            return True
-        return False
+                try:
+                    self.soup = BeautifulSoup(content, features="lxml")
+                except Exception:
+                    try:
+                        self.soup = BeautifulSoup(content, features="html.parser")
+                    except Exception as e2:
+                        return False, f"Failed to parse HTML: {str(e2)}", []
 
-novgen_bot = NovGenBot()
+            if not os.path.exists(pagefolder):
+                os.makedirs(pagefolder, exist_ok=True)
 
-def set_bot_commands():
-    commands = [
-        BotCommand("start", "Start NovGen Bot"),
-        BotCommand("gen", "Generate CC From Bin"),
-        BotCommand("chk", "Check Approved Card")
-    ]
-    bot.set_my_commands(commands)
+            file_paths = []
+            all_resource_urls = set()
 
-def create_regenerate_button(bin_number):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Regenerate Cards", callback_data=f"regen_{bin_number}"))
-    return markup
+            if self.linkFlg: all_resource_urls.update(self._extract_css_resources(url))
+            if self.scriptFlg: all_resource_urls.update(self._extract_js_resources(url))
+            if self.imgFlg: all_resource_urls.update(self._extract_image_resources(url))
+            all_resource_urls.update(self._extract_other_resources(url))
+            all_resource_urls.update(self._extract_inline_urls(str(self.soup), url))
+            all_resource_urls.update(self._extract_meta_resources(url))
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "No username"
-    first_name = message.from_user.first_name or "Unknown"
-    add_user(user_id, username, first_name)
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("Join Updates", url=CHANNEL_URL))
-    
-    welcome_msg = f"""<b>Hi! Welcome to {novgen_bot.bot_name}</b>
+            all_resource_urls = [u for u in all_resource_urls if u and self._is_valid_url(u)]
 
-NovGen is your ultimate toolkit on Telegram, packed with CC generators, educational resources, downloaders, temp mail, crypto utilities, and more. Simplify your tasks with cardin ease!
+            if all_resource_urls:
+                downloaded_resources = await self._download_all_resources(all_resource_urls, pagefolder, session)
+                file_paths.extend(downloaded_resources)
 
-Don't forget to Join for updates!"""
-    
-    bot.send_message(
-        message.chat.id,
-        welcome_msg,
-        parse_mode='HTML',
-        reply_markup=markup
-    )
+            await self._update_html_paths(url, pagefolder)
 
-@bot.message_handler(commands=['bd'])
-def broadcast_message(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    if len(message.text.split()) < 2:
-        bot.reply_to(message, "<b>Usage:</b> /bd Your broadcast message here", parse_mode='HTML')
-        return
-    
-    broadcast_text = message.text[4:].strip()
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("Confirm", callback_data="broadcast_confirm"),
-        InlineKeyboardButton("Cancel", callback_data="broadcast_cancel")
-    )
-    
-    bot.reply_to(
-        message, 
-        f"{broadcast_text}\n\nSend this message to all users?", 
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('broadcast_'))
-def handle_broadcast_confirmation(call):
-    if call.message.chat.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "Unauthorized")
-        return
-    
-    if call.data == "broadcast_confirm":
-        bot.answer_callback_query(call.id, "Broadcasting started...")
-        
-        original_text = call.message.text
-        broadcast_msg = original_text.split("\n\nSend this")[0]
-        
-        users = load_users()
-        total_users = len(users)
-        success_count = 0
-        fail_count = 0
-        
-        for user_id in users.keys():
+            html_path = os.path.join(pagefolder, 'index.html')
             try:
-                bot.send_message(
-                    int(user_id),
-                    f"{broadcast_msg}",
-                    parse_mode='HTML'
-                )
-                success_count += 1
+                html_content = self.soup.prettify('utf-8')
+                async with aiofiles.open(html_path, 'wb') as file:
+                    await file.write(html_content)
+                file_paths.append(html_path)
             except Exception as e:
-                fail_count += 1
-        
-        summary = f"""<b>Broadcast Complete</b>
+                logger.error(f"HTML save error: {e}")
+                return False, "Failed to save HTML file.", file_paths
 
-Total Users: {total_users}
-Success: {success_count}
-Failed: {fail_count}"""
-        
-        bot.edit_message_text(
-            summary,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='HTML'
-        )
-        
-    elif call.data == "broadcast_cancel":
-        bot.edit_message_text(
-            "<b>Broadcast cancelled</b>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='HTML'
-        )
-        bot.answer_callback_query(call.id, "Broadcast cancelled")
+            return True, None, file_paths
 
-@bot.message_handler(commands=['gen'])
-def generate_cc(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "No username"
-    first_name = message.from_user.first_name or "Unknown"
-    add_user(user_id, username, first_name)
-    
-    try:
-        if len(message.text.split()) > 1:
-            bin_number = message.text.replace('/gen', '').strip()
-            process_gen_directly(message, bin_number)
-        else:
-            help_msg = f"""<b>Generate CC From Bin</b>
-
-Send BIN in format:
-<code>/gen BIN</code>
-
-Example:
-<code>/gen 453201</code>
-<code>/gen 512345</code>
-<code>/gen 378282</code>
-
-Note: BIN must be 6-15 digits"""
-            
-            bot.reply_to(message, help_msg, parse_mode='HTML')
-    except Exception as e:
-        pass
-
-def process_gen_directly(message, bin_number):
-    try:
-        if not novgen_bot.validate_bin(bin_number):
-            bot.reply_to(message, "<b>Invalid BIN! Must be 6-15 digits</b>", parse_mode='HTML')
-            return
-        
-        bin_info = novgen_bot.get_bin_info(bin_number[:6])
-        cards = novgen_bot.generate_luhn_cards(bin_number, count=10)
-        
-        response = f"<b>BIN → {bin_number}</b>\n"
-        response += f"<b>Amount → 10</b>\n\n"
-        
-        for card in cards:
-            response += f"<code>{card}</code>\n"
-        
-        scheme = bin_info.get('scheme', 'UNKNOWN')
-        bank = bin_info.get('bank', 'UNKNOWN BANK')
-        country = bin_info.get('country', 'UNKNOWN')
-        
-        response += f"\n<b>Info:</b> {scheme}\n"
-        response += f"<b>Bank:</b> {bank}\n"
-        response += f"<b>Country:</b> {country}"
-        
-        current_time = datetime.now().strftime("%I:%M %p")
-        response += f"\n{current_time}"
-        
-        markup = create_regenerate_button(bin_number)
-        bot.reply_to(message, response, parse_mode='HTML', reply_markup=markup)
-        
-    except Exception as e:
-        bot.reply_to(message, f"<b>Error: {str(e)}</b>", parse_mode='HTML')
-
-@bot.message_handler(func=lambda message: message.text and message.text.startswith('/gen'))
-def handle_gen_all(message):
-    if len(message.text.split()) > 1:
-        bin_number = message.text.replace('/gen', '').strip()
-        process_gen_directly(message, bin_number)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('regen_'))
-def regenerate_cards(call):
-    try:
-        bin_number = call.data.replace('regen_', '')
-        
-        bin_info = novgen_bot.get_bin_info(bin_number[:6])
-        cards = novgen_bot.generate_luhn_cards(bin_number, count=10)
-        
-        response = f"<b>BIN → {bin_number}</b>\n"
-        response += f"<b>Amount → 10</b>\n\n"
-        
-        for card in cards:
-            response += f"<code>{card}</code>\n"
-        
-        scheme = bin_info.get('scheme', 'UNKNOWN')
-        bank = bin_info.get('bank', 'UNKNOWN BANK')
-        country = bin_info.get('country', 'UNKNOWN')
-        
-        response += f"\n<b>Info:</b> {scheme}\n"
-        response += f"<b>Bank:</b> {bank}\n"
-        response += f"<b>Country:</b> {country}"
-        
-        current_time = datetime.now().strftime("%I:%M %p")
-        response += f"\n{current_time}"
-        
-        markup = create_regenerate_button(bin_number)
-        
-        bot.edit_message_text(
-            response,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='HTML',
-            reply_markup=markup
-        )
-        
-        bot.answer_callback_query(call.id, "Cards regenerated successfully!")
-        
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Error: {str(e)}")
-
-@bot.message_handler(commands=['chk'])
-def check_card_command(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "No username"
-    first_name = message.from_user.first_name or "Unknown"
-    add_user(user_id, username, first_name)
-    
-    try:
-        text = message.text
-        
-        if len(text.split()) > 1:
-            card_data = text[5:].strip() if text.startswith('/chk ') else text[4:].strip()
-            
-            if card_data:
-                process_card_check(message, card_data)
-            else:
-                show_help(message)
-        else:
-            show_help(message)
-    except Exception as e:
-        bot.reply_to(message, f"<b>Error: {str(e)}</b>", parse_mode='HTML')
-
-def show_help(message):
-    help_msg = f"""<b>Check Approved Card</b>
-
-Send card details in any format:
-
-<code>/chk 4532010914221065|06|2027|892</code>
-<code>/chk 4532010914221065 06 2027 892</code>
-<code>/chk 4532010914221065/06/2027/892</code>
-
-The bot will automatically detect and format them."""
-    
-    bot.reply_to(message, help_msg, parse_mode='HTML')
-
-def process_card_check(message, card_data):
-    try:
-        if '|' in card_data:
-            parts = card_data.split('|')
-        elif '/' in card_data:
-            parts = card_data.split('/')
-        elif ' ' in card_data:
-            parts = card_data.split()
-        else:
-            numbers = re.findall(r'\d+', card_data)
-            if len(numbers) >= 4:
-                parts = numbers
-            else:
-                bot.reply_to(message, "<b>Invalid format! Could not extract card details.</b>", parse_mode='HTML')
-                return
-        
-        clean_parts = []
-        for part in parts:
-            part = part.strip()
-            if part:
-                digits = re.sub(r'\D', '', part)
-                if digits:
-                    clean_parts.append(digits)
-        
-        if len(clean_parts) < 4:
-            bot.reply_to(message, "<b>Insufficient data! Need card, month, year, and CVV.</b>", parse_mode='HTML')
-            return
-        
-        card_number = clean_parts[0]
-        month = clean_parts[1]
-        year = clean_parts[2]
-        cvv = clean_parts[3]
-        
-        if len(month) == 1:
-            month = '0' + month
-        elif len(month) > 2:
-            month = month[:2]
-        
-        if len(year) == 2:
-            year = '20' + year
-        elif len(year) > 4:
-            year = year[:4]
-        
-        if len(card_number) != 16 or not card_number.isdigit():
-            bot.reply_to(message, "<b>Invalid card number! Must be 16 digits.</b>", parse_mode='HTML')
-            return
-        
-        if not month.isdigit() or int(month) < 1 or int(month) > 12:
-            bot.reply_to(message, "<b>Invalid month! Must be 01-12.</b>", parse_mode='HTML')
-            return
-        
-        if not year.isdigit() or len(year) != 4:
-            bot.reply_to(message, "<b>Invalid year! Must be 4 digits (YYYY).</b>", parse_mode='HTML')
-            return
-        
-        if not cvv.isdigit() or len(cvv) < 3 or len(cvv) > 4:
-            bot.reply_to(message, "<b>Invalid CVV! Must be 3-4 digits.</b>", parse_mode='HTML')
-            return
-        
-        result = novgen_bot.check_card(card_number, month, year, cvv)
-        
-        response = f"""<b>Card →</b> <code>{card_number} | {month} | {year} | {cvv}</code>
-<b>Status →</b> {result['status']}
-<b>Msg →</b> {result['message']}"""
-        
-        if 'bin_info' in result and result['bin_info']:
-            response += f"""
-
-<b>Info →</b> {result['bin_info'].get('scheme', 'UNKNOWN')}
-<b>Bank →</b> {result['bin_info'].get('bank', 'UNKNOWN BANK')}
-<b>Country →</b> {result['bin_info'].get('country', 'UNKNOWN')}"""
-        
-        current_time = datetime.now().strftime("%I:%M %p")
-        response += f"\n{current_time}"
-        
-        bot.reply_to(message, response, parse_mode='HTML')
-        
-    except Exception as e:
-        bot.reply_to(message, f"<b>Error processing card: {str(e)}</b>", parse_mode='HTML')
-
-@bot.message_handler(func=lambda message: message.text and message.text.startswith('/chk'))
-def handle_all_chk(message):
-    check_card_command(message)
-
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    pass
-
-def start_bot():
-    """Start the bot with proper error handling for Render"""
-    while True:
-        try:
-            print(f"{novgen_bot.bot_name} Is Running")
-            print(f"Admin ID: {ADMIN_ID}")
-            print(f"Channel URL: {CHANNEL_URL}")
-            
-            bot.remove_webhook()
-            set_bot_commands()
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except asyncio.TimeoutError:
+            return False, "Request timed out. The website took too long to respond.", []
+        except aiohttp.ClientError as e:
+            return False, f"Network error occurred: {str(e)}", []
         except Exception as e:
-            print(f"Bot crashed: {str(e)}")
-            print("Restarting in 5 seconds...")
-            time.sleep(5)
+            logger.error(f"Unexpected scraping error: {e}", exc_info=True)
+            return False, "An unexpected parsing error occurred.", []
+
+    def _is_valid_url(self, url):
+        if not url or not isinstance(url, str): return False
+        return not url.startswith(('data:', 'blob:', 'javascript:', 'mailto:', 'tel:', '#', 'about:'))
+
+    def _extract_css_resources(self, base_url):
+        urls = set()
+        if not self.soup: return urls
+        for link in self.soup.find_all('link', href=True):
+            rel = link.get('rel', [])
+            if isinstance(rel, str): rel = [rel]
+            if 'stylesheet' in rel or link.get('type') == 'text/css':
+                urls.add(urljoin(base_url, link.get('href').strip()))
+        return urls
+
+    def _extract_js_resources(self, base_url):
+        urls = set()
+        if not self.soup: return urls
+        for script in self.soup.find_all('script', src=True):
+            urls.add(urljoin(base_url, script.get('src').strip()))
+        return urls
+
+    def _extract_image_resources(self, base_url):
+        urls = set()
+        if not self.soup: return urls
+        for img in self.soup.find_all('img'):
+            if img.get('src'): urls.add(urljoin(base_url, img.get('src').strip()))
+            if img.get('data-src'): urls.add(urljoin(base_url, img.get('data-src').strip()))
+        return urls
+
+    def _extract_other_resources(self, base_url):
+        urls = set()
+        if not self.soup: return urls
+        for tag, attr in [('audio', 'src'), ('video', 'src'), ('embed', 'src'), ('object', 'data')]:
+            for el in self.soup.find_all(tag, **{attr: True}):
+                urls.add(urljoin(base_url, el.get(attr).strip()))
+        return urls
+
+    def _extract_meta_resources(self, base_url):
+        urls = set()
+        if not self.soup: return urls
+        for meta in self.soup.find_all('meta', content=True):
+            content = meta.get('content', '')
+            if content.startswith(('http://', 'https://', '/')):
+                urls.add(urljoin(base_url, content))
+        return urls
+
+    def _extract_css_urls(self, css_content, base_url):
+        urls = set()
+        for css_url in re.findall(r'url\s*\(\s*["\']?([^"\'()]+)["\']?\s*\)', css_content, re.IGNORECASE):
+            if not css_url.startswith(('data:', 'blob:', 'javascript:')):
+                urls.add(urljoin(base_url, css_url.strip()))
+        return urls
+
+    def _extract_inline_urls(self, html_content, base_url):
+        urls = set()
+        for style_block in re.findall(r'<style[^>]*>(.*?)</style>', html_content, re.DOTALL | re.IGNORECASE):
+            urls.update(self._extract_css_urls(style_block, base_url))
+        return urls
+
+    async def _download_all_resources(self, resource_urls, pagefolder, session):
+        tasks, file_paths = [], []
+        for resource_url in resource_urls:
+            if resource_url not in self.downloaded_files and resource_url not in self.failed_urls:
+                self.downloaded_files.add(resource_url)
+                file_path = self._get_resource_path(resource_url, pagefolder)
+                if file_path:
+                    file_paths.append(file_path)
+                    tasks.append(self._download_single_resource(resource_url, file_path, session))
+
+        if tasks:
+            try:
+                for i in range(0, len(tasks), 25):
+                    await asyncio.gather(*tasks[i:i+25], return_exceptions=True)
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Batch download error: {e}")
+        return file_paths
+
+    def _get_resource_path(self, resource_url, pagefolder):
+        try:
+            parsed_url = urlparse(resource_url)
+            path = unquote(parsed_url.path)
+            if not path or path == '/': return None
+            
+            filename = path.strip('/').split('/')[-1]
+            file_ext = filename.split('.')[-1].lower() if '.' in filename else 'html'
+            folder_name = self.extensions.get(file_ext, 'assets')
+            
+            target_folder = os.path.join(pagefolder, folder_name)
+            os.makedirs(target_folder, exist_ok=True)
+            
+            full_path = os.path.join(target_folder, filename)
+            counter = 1
+            while os.path.exists(full_path):
+                name, ext = os.path.splitext(filename)
+                full_path = os.path.join(target_folder, f"{name}_{counter}{ext}")
+                counter += 1
+            return full_path
+        except Exception:
+            return None
+
+    async def _download_single_resource(self, resource_url, file_path, session):
+        async with self.semaphore:
+            try:
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                async with session.get(resource_url, timeout=10, headers=headers) as response:
+                    if response.status != 200:
+                        self.failed_urls.add(resource_url)
+                        return False
+                    
+                    content = await response.read()
+                    if not content or len(content) > self.size_limit:
+                        return False
+
+                    async with aiofiles.open(file_path, 'wb') as f:
+                        await f.write(content)
+                    return True
+            except Exception:
+                self.failed_urls.add(resource_url)
+                return False
+
+    async def _update_html_paths(self, base_url, pagefolder):
+        if not self.soup: return
+        for tag, attr in [('img', 'src'), ('link', 'href'), ('script', 'src')]:
+            for el in self.soup.find_all(tag, **{attr: True}):
+                original_url = urljoin(base_url, el.get(attr))
+                local_path = self._get_local_path(original_url)
+                if local_path: el[attr] = local_path
+
+    def _get_local_path(self, resource_url):
+        try:
+            parsed_url = urlparse(resource_url)
+            path = unquote(parsed_url.path)
+            if not path or path == '/': return None
+            
+            filename = path.strip('/').split('/')[-1]
+            file_ext = filename.split('.')[-1].lower() if '.' in filename else 'html'
+            folder_name = self.extensions.get(file_ext, 'assets')
+            return f"{folder_name}/{filename}"
+        except Exception:
+            return None
+
+async def create_zip(folder_path):
+    temp_file = None
+    try:
+        if not os.path.exists(folder_path): return None
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_file.close()
+
+        def _create_zip_sync():
+            with zipfile.ZipFile(temp_file.name, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for root, _, files in os.walk(folder_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        zip_file.write(file_path, os.path.relpath(file_path, folder_path))
+            return temp_file.name
+
+        return await asyncio.get_event_loop().run_in_executor(None, _create_zip_sync)
+    except Exception as e:
+        logger.error(f"Zip Creation Error: {e}")
+        if temp_file and os.path.exists(temp_file.name):
+            os.unlink(temp_file.name)
+        return None
+
+async def clean_download(target_path):
+    if not target_path or not os.path.exists(target_path):
+        return
+    try:
+        if os.path.isfile(target_path):
+            await asyncio.get_event_loop().run_in_executor(None, os.unlink, target_path)
+        elif os.path.isdir(target_path):
+            await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, target_path)
+    except Exception as e:
+        logger.error(f"Cleanup Error on {target_path}: {e}")
+
+@bot.on_message(filters.command("start", prefixes=COMMAND_PREFIX) & (filters.group | filters.private))
+async def start_command(client: Client, message):
+    try:
+        formatted_msg = START_MSG.format(bot_name=client.me.first_name)
+        await message.reply_text(text=formatted_msg)
+    except Exception as e:
+        logger.error(f"Start command failed: {e}")
+
+@bot.on_message(filters.command(["ws", "websource"], prefixes=COMMAND_PREFIX) & (filters.group | filters.private))
+async def websource(client: Client, message):
+    url = message.text.split()[1] if len(message.text.split()) > 1 else None
+    if not url:
+        return await message.reply_text("Please provide a valid URL.\nExample: `/ws google.com`")
+
+    if not url.startswith(('http://', 'https://')):
+        url = f"https://{url}"
+
+    loading_msg = await message.reply_text("Downloading Source Code...\n`Extracting assets...`")
+    
+    pagefolder = os.path.join("downloads", f"page_{message.chat.id}_{message.id}")
+    zip_file_path = None
+    
+    start_time = asyncio.get_event_loop().time()
+
+    try:
+        connector = aiohttp.TCPConnector(limit=100)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            downloader = UrlDownloader()
+            success, error, _ = await downloader.savePage(url, pagefolder, session)
+
+            if not success:
+                return await loading_msg.edit_text(f"Failed to download.\n`{error}`")
+
+            await loading_msg.edit_text("Compressing files into ZIP...")
+            zip_file_path = await create_zip(pagefolder)
+
+            if not zip_file_path:
+                return await loading_msg.edit_text("Failed to create archive.")
+
+            zip_size_mb = os.path.getsize(zip_file_path) / (1024 * 1024)
+            time_taken = asyncio.get_event_loop().time() - start_time
+            domain = urlparse(url).netloc.replace('www.', '')
+
+            caption = (
+                "Website Source Download Successful\n"
+                "----------------------\n"
+                f"Website: `{domain}`\n"
+                f"Archive Size: `{zip_size_mb:.2f} MB`\n"
+                f"Time Taken: `{time_taken:.2f}s`\n"
+                "----------------------\n"
+                f"Downloaded By: {message.from_user.mention}"
+            )
+
+            await loading_msg.delete()
+            await message.reply_document(
+                document=zip_file_path,
+                file_name=f"Source_{domain}.zip",
+                caption=caption
+            )
+
+    except aiohttp.InvalidURL:
+        await loading_msg.edit_text("The provided URL is invalid.")
+    except Exception as e:
+        logger.error(f"Process Error: {e}", exc_info=True)
+        try:
+            await loading_msg.edit_text("An unexpected error occurred while processing.")
+        except Exception:
+            pass
+    finally:
+        await clean_download(pagefolder)
+        await clean_download(zip_file_path)
 
 if __name__ == "__main__":
-    start_bot()
+    logger.info("Starting Bot...")
+    try:
+        bot.run()
+    except Exception as e:
+        logger.error(f"Bot initialization failed: {e}")

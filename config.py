@@ -1,3 +1,5 @@
-BOT_TOKEN = "8358247195:AAGKjkqRrmTDXff6EBQHrwPJJRDop54xJ5k"
-ADMIN_ID = 8236879410
-CHANNEL_URL = "https://t.me/xoreez"
+API_ID = 12345678
+API_HASH = ""
+BOT_TOKEN = ""
+COMMAND_PREFIX = [",", ".", "/", " #", "!"]
+UPDATES_CHANNEL_URL = "https://t.me/xoreez"
