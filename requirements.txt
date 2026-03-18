@@ -1,5 +1,0 @@
-pyrogram
-aiohttp
-aiofiles
-beautifulsoup4
-lxml
